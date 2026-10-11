@@ -15,6 +15,8 @@ Detailed reference for Database Deployment Manager. For an overview and quick st
 - [Local SQL Server examples](#local-sql-server-examples)
 - [Deploying to Microsoft Fabric](#deploying-to-microsoft-fabric)
 - [Testing a connection outside the tool](#testing-a-connection-outside-the-tool)
+- [Using a git repository (Azure DevOps, GitHub and others)](#using-a-git-repository-azure-devops-github-and-others)
+- [Check version and file headers](#check-version-and-file-headers)
 
 ## Key terms
 
@@ -391,16 +393,117 @@ Notes:
 
 For S3, entries are object keys relative to the configured prefix.
 
-## Check version
+## Using a git repository (Azure DevOps, GitHub and others)
 
-When **Check version** is enabled, the tool reads a version declaration near the
-top of each SQL file and shows it in the **Version** column:
+The tool reads SQL files from a folder, so any git repository works once it is
+cloned locally. Nothing in the tool is specific to a git host, and it never
+stores git credentials: git (and Git Credential Manager) handles the sign-in.
 
-```sql
--- Version: 1.2.3
+```powershell
+# Azure DevOps Repos
+git clone https://dev.azure.com/<organization>/<project>/_git/<repository> C:\Source\MyDatabaseRepo
+
+# GitHub
+git clone https://github.com/<account>/<repository>.git C:\Source\MyDatabaseRepo
+
+# Later, to get the latest changes
+git -C C:\Source\MyDatabaseRepo pull
 ```
 
-For S3 only the beginning of each object is retrieved.
+Then set the **Repository root** to the cloned folder (or a subfolder of it).
+
+**Important: file dates after a clone.** The **Modified since date/time**
+detection compares file timestamps. Git sets a file's timestamp to the moment
+it was checked out, not the time of the commit:
+
+- After a fresh `git clone`, every file looks modified at the clone time, so
+  "modified since" lists everything newer than that.
+- After a `git pull`, only the files that changed are touched, so a cutoff set
+  to just before the pull finds the files the pull brought in.
+- A branch switch can touch many files at once.
+
+For a precise list, build an **Explicit file list** from git itself. The tool
+needs paths relative to the Repository root with backslashes:
+
+```powershell
+$repo = 'C:\Source\MyDatabaseRepo'
+
+# Files added or modified on this branch compared with main
+git -C $repo diff --name-only --diff-filter=AM main...HEAD -- '*.sql' |
+    ForEach-Object { $_ -replace '/', '\' } | Set-Clipboard
+
+# Files changed in commits since a date
+git -C $repo log --since='2026-10-01' --name-only --pretty=format: -- '*.sql' |
+    Where-Object { $_ } | Sort-Object -Unique |
+    ForEach-Object { $_ -replace '/', '\' } | Set-Clipboard
+```
+
+Paste the clipboard into the explicit list box. Git reports paths relative to
+the top of the repository. When your Repository root is a subfolder, add
+`--relative` to `git diff` (and run it with `-C` pointing at that subfolder) so
+the paths are relative to it. Items that are not found show as **Missing**
+in the review grid.
+
+Deleting a file in git does not drop the object from the database; the tool only
+deploys files that exist.
+
+## Check version and file headers
+
+When **Check version** is enabled, the tool reads the top of each SQL file and
+shows the version it finds in the **Version** column. This only works if your
+files carry a header with a version line. Files without one show an empty
+Version column; deployment itself does not depend on it.
+
+Rules the tool applies:
+
+- Only the **first 80 lines** of the file are read (for S3, only the beginning
+  of the object).
+- It looks for a line that starts with the word `Version`, optionally after a
+  comment marker (`--`, `/*`, `*`, `//` or `#`), followed by `:` or `=` and a
+  number with at least one dot, for example `1.2` or `1.2.3`. Up to five
+  parts are accepted, and letters, `_` and `-` are allowed after the first
+  part (`1.2.3-beta`).
+- The **first** matching line wins, so keep one `Version :` line near the top
+  and do not repeat that form in a change history.
+- Every other header field (author, dates, purpose) is for people; the tool
+  ignores it.
+
+Example header for a stored procedure, view or function:
+
+```sql
+/*
+Script   : usp_GetCustomerOrders
+Author   : Your Name
+Created  : 2026-01-15
+Modified : 2026-10-11
+Version  : 1.2.0
+Purpose  : Returns the open orders for a customer.
+
+Change history:
+  1.2.0 - 2026-10-11 - Added @IncludeClosed parameter
+  1.1.0 - 2026-06-02 - Added index hint for large customers
+  1.0.0 - 2026-01-15 - Initial version
+*/
+```
+
+These single-line forms are also recognized:
+
+```sql
+-- Version: 1.2.0
+/* Version: 1.2.0 */
+```
+
+A PowerShell-style header is accepted too, with the version on the line after
+`.VERSION`:
+
+```text
+.VERSION
+    1.2.0
+```
+
+To add a header to many existing files, start with one convention for the whole
+repository and agree who updates `Version` and `Modified` when a file changes
+(for example as part of each pull request).
 
 ## Pre-deployment review
 

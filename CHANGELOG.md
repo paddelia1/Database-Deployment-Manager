@@ -9,6 +9,9 @@
 - New authentication mode `SqlLogin` (SQL Server login, password prompted once
   per session and never stored). Added to the value set dialog.
 - Optional `SqlCmdPath` per value set, overriding the SQLCMD box.
+- Usage guide: installation with PowerShell examples, key terms, config
+  reference, using git repositories (Azure DevOps, GitHub) and the file header
+  format required by Check version.
 - "Edit config file..." opens the file that holds the selected value set;
   "Edit main config file..." opens the main config.
 
