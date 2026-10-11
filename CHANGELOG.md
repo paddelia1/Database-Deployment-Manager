@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.2.0 - 2026-10-11
+
+- New "New / edit value set..." dialog in the Value set menu: create or change
+  a value set (hosts, databases, authentication) from the GUI without
+  restarting. Saved sets are written to
+  `Config/Database Deployment valuesets.user.psd1` (git-ignored, generated).
+- New authentication mode `SqlLogin` (SQL Server login, password prompted once
+  per session and never stored). Added to the value set dialog.
+- Optional `SqlCmdPath` per value set, overriding the SQLCMD box.
+- "Edit config file..." opens the file that holds the selected value set;
+  "Edit main config file..." opens the main config.
+
+## 1.1.0 - 2026-10-11
+
+- Selectable authentication per value set: `Windows` (default),
+  `EntraInteractive` (with `AuthUser`) or `EntraDefault`. Enables deployments to
+  Microsoft Fabric warehouses and Azure SQL. Applies to Test Connection,
+  immediate deployments and generated scripts.
+- Example config includes a `FabricExample` value set.
+
 ## 1.0.0 - 2026-10-10
 
 Initial public release.

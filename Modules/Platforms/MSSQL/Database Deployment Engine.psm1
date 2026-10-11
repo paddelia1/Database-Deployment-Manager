@@ -4,10 +4,10 @@
     Database Deployment Manager - Deployment Engine
 
 .VERSION
-    1.0.0
+    1.2.0
 
 .MODIFIED
-    2026-10-10
+    2026-10-11
 
 .AUTHOR
     Philippe Addelia
@@ -30,6 +30,17 @@
       - Initialization and deployment execution
 
     Change history:
+      Version 1.2.0 - 2026-10-11:
+        - new sqlcmd authentication mode SqlLogin (SQL Server login): the login
+          name comes from AuthUser and the password is read from the
+          SQLCMDPASSWORD environment variable, never from the command line.
+
+      Version 1.1.0 - 2026-10-11:
+        - selectable sqlcmd authentication: Windows (default), Microsoft Entra
+          interactive, or Microsoft Entra default credential (for example
+          Microsoft Fabric warehouses),
+        - longer login timeout when Microsoft Entra authentication is used.
+
       Version 1.0.0 - 2026-10-10:
         - Initial public release.
 #>
@@ -599,6 +610,45 @@ function Get-DDMSqlCmdPath {
     return $null
 }
 
+function Get-DDMSqlCmdAuthArguments {
+    [CmdletBinding()]
+    param(
+        [string]$AuthMode = 'Windows',
+        [string]$AuthUser = ''
+    )
+
+    if ([string]::IsNullOrWhiteSpace($AuthMode)) {
+        $AuthMode = 'Windows'
+    }
+
+    switch ($AuthMode) {
+        'Windows' {
+            return @('-E')
+        }
+        'EntraInteractive' {
+            if ([string]::IsNullOrWhiteSpace($AuthUser)) {
+                throw "Authentication 'EntraInteractive' requires AuthUser (your Microsoft Entra user name, for example user@contoso.com) in the value set."
+            }
+            return @('-G', '-U', $AuthUser)
+        }
+        'EntraDefault' {
+            return @('-G')
+        }
+        'SqlLogin' {
+            if ([string]::IsNullOrWhiteSpace($AuthUser)) {
+                throw "Authentication 'SqlLogin' requires AuthUser (the SQL Server login name) in the value set."
+            }
+            if ([string]::IsNullOrEmpty($env:SQLCMDPASSWORD)) {
+                throw "Authentication 'SqlLogin' needs the password in the SQLCMDPASSWORD environment variable (the GUI prompts for it)."
+            }
+            return @('-U', $AuthUser)
+        }
+        default {
+            throw "Unsupported Authentication value '$AuthMode'. Use Windows, SqlLogin, EntraInteractive or EntraDefault."
+        }
+    }
+}
+
 function Invoke-DDMSqlCmdText {
     [CmdletBinding()]
     param(
@@ -606,7 +656,9 @@ function Invoke-DDMSqlCmdText {
         [Parameter(Mandatory)][string]$Database,
         [Parameter(Mandatory)][string]$Query,
         [Parameter(Mandatory)][string]$SqlCmdExe,
-        [int]$QueryTimeout = 120
+        [int]$QueryTimeout = 120,
+        [string]$AuthMode = 'Windows',
+        [string]$AuthUser = ''
     )
 
     $tempSqlFile = [System.IO.Path]::ChangeExtension(
@@ -622,7 +674,9 @@ function Invoke-DDMSqlCmdText {
             -Database $Database `
             -FilePath $tempSqlFile `
             -SqlCmdExe $SqlCmdExe `
-            -QueryTimeout $QueryTimeout
+            -QueryTimeout $QueryTimeout `
+            -AuthMode $AuthMode `
+            -AuthUser $AuthUser
     }
     finally {
         if (Test-Path -LiteralPath $tempSqlFile) {
@@ -638,19 +692,26 @@ function Invoke-DDMSqlCmdFile {
         [Parameter(Mandatory)][string]$Database,
         [Parameter(Mandatory)][string]$FilePath,
         [Parameter(Mandatory)][string]$SqlCmdExe,
-        [int]$QueryTimeout = 120
+        [int]$QueryTimeout = 120,
+        [string]$AuthMode = 'Windows',
+        [string]$AuthUser = ''
     )
+
+    $authArgs = @(Get-DDMSqlCmdAuthArguments -AuthMode $AuthMode -AuthUser $AuthUser)
+
+    # Microsoft Entra sign-in can take longer (browser prompt, MFA).
+    $loginTimeout = if ([string]::IsNullOrWhiteSpace($AuthMode) -or $AuthMode -eq 'Windows' -or $AuthMode -eq 'SqlLogin') { '30' } else { '120' }
 
     $args = @(
         '-S', $ServerInstance,
-        '-d', $Database,
-        '-E',
+        '-d', $Database
+    ) + $authArgs + @(
         '-b',
         '-w', '65535',
         '-y', '0',
         '-Y', '0',
         '-i', $FilePath,
-        '-l', '30',
+        '-l', $loginTimeout,
         '-t', $QueryTimeout
     )
 
@@ -930,7 +991,9 @@ function Invoke-DDMDeploymentPlan {
         [string]$DbMapServer = '',
         [string]$DbMapSource = '',
         [string]$DbMapReplacement = '',
-        [scriptblock]$LogAction
+        [scriptblock]$LogAction,
+        [string]$AuthMode = 'Windows',
+        [string]$AuthUser = ''
     )
 
     # Normalize scalar/list inputs and defensively flatten any accidentally
@@ -1064,7 +1127,9 @@ function Invoke-DDMDeploymentPlan {
                         -Database $Database `
                         -FilePath $preparedFile `
                         -SqlCmdExe $SqlCmdExe `
-                        -QueryTimeout $QueryTimeout
+                        -QueryTimeout $QueryTimeout `
+                        -AuthMode $AuthMode `
+                        -AuthUser $AuthUser
 
                     if (-not [string]::IsNullOrWhiteSpace($output)) {
                         Write-DDMEngineLog $LogAction $output 'Raw'
@@ -1172,6 +1237,7 @@ Export-ModuleMember -Function @(
     'Get-DDMS3ObjectUseStatementInfo',
     'Get-DDMFileSystemCandidates',
     'Get-DDMSqlCmdPath',
+    'Get-DDMSqlCmdAuthArguments',
     'Invoke-DDMSqlCmdText',
     'Invoke-DDMSqlCmdFile',
     'Convert-DDMSqlText',

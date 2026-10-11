@@ -18,3 +18,4 @@ DDM_SQL_*.sql
 *.tmp
 Thumbs.db
 Desktop.ini
+Config/Database Deployment valuesets.user.psd1

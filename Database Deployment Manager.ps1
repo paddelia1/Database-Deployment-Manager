@@ -4,10 +4,10 @@
     Database Deployment Manager
 
 .VERSION
-    1.0.0
+    1.2.0
 
 .MODIFIED
-    2026-10-10
+    2026-10-11
 
 .AUTHOR
     Philippe Addelia
@@ -32,6 +32,30 @@
     The explicit list is persisted between runs.
 
 .NOTES
+    Version 1.2.0 - 2026-10-11:
+      - Optional SqlCmdPath per value set (for example the Go-based sqlcmd for
+        Microsoft Fabric and the ODBC sqlcmd for local servers). When a set defines
+        it, it overrides the SQLCMD box on the main window; settable in the
+        value set dialog.
+      - New authentication mode SqlLogin (SQL Server login). AuthUser is the login
+        name; the password is prompted once per session, kept in memory only and
+        passed to sqlcmd through the SQLCMDPASSWORD environment variable. Generated
+        deployment scripts prompt for it when they run. "Forget SQL login password"
+        added to the Value set menu.
+      - New "New / edit value set..." dialog (Value set menu): create or change
+        a value set (hosts, databases, authentication) from the GUI. Saved sets
+        are written to Config\Database Deployment valuesets.user.psd1 (git-ignored,
+        generated) and are available immediately, without restarting.
+      - "Edit config file..." now opens the file that holds the selected value
+        set (saved sets file or main config). "Edit main config file..." added.
+
+    Version 1.1.0 - 2026-10-11:
+      - Selectable authentication per value set (Authentication / AuthUser in the
+        config): Windows (default), EntraInteractive or EntraDefault, so the tool
+        can deploy to Microsoft Fabric warehouses and Azure SQL.
+      - The authentication mode is logged and used by Test Connection, immediate
+        deployments and generated deployment scripts.
+
     Version 1.0.0 - 2026-10-10:
       - Initial public release.
 
@@ -67,7 +91,7 @@ if (-not (Test-Path -LiteralPath $ConfigPath) -and (Test-Path -LiteralPath $Conf
     try {
         Copy-Item -LiteralPath $ConfigExamplePath -Destination $ConfigPath -ErrorAction Stop
         [System.Windows.Forms.MessageBox]::Show(
-            "First run: a configuration file was created from the example:`r`n$ConfigPath`r`n`r`nUse the Value set '...' button and choose 'Edit config file...' to enter your own servers, databases and repository root, then restart the tool.",
+            "First run: a configuration file was created from the example:`r`n$ConfigPath`r`n`r`nUse the Value set '...' button and choose 'New / edit value set...' to enter your own servers and databases (or 'Edit main config file...' to change other settings), no restart is needed for saved value sets.",
             'Database Deployment Manager',
             [System.Windows.Forms.MessageBoxButtons]::OK,
             [System.Windows.Forms.MessageBoxIcon]::Information
@@ -115,6 +139,39 @@ if (-not ($AppConfig.ValueSets -is [hashtable]) -or $AppConfig.ValueSets.Count -
         [System.Windows.Forms.MessageBoxIcon]::Error
     ) | Out-Null
     return
+}
+
+# Value sets saved from the GUI live in a separate generated file so the main
+# config (and its comments) is never rewritten by the tool.
+$UserValueSetsPath = Join-Path (Join-Path $PSScriptRoot 'Config') 'Database Deployment valuesets.user.psd1'
+$script:BaseValueSets = @{}
+$script:UserValueSets = @{}
+$script:ValueSetSource = @{}
+
+foreach ($baseKey in @($AppConfig.ValueSets.Keys)) {
+    $script:BaseValueSets[[string]$baseKey] = $AppConfig.ValueSets[$baseKey]
+    $script:ValueSetSource[[string]$baseKey] = $ConfigPath
+}
+
+if (Test-Path -LiteralPath $UserValueSetsPath) {
+    try {
+        $userValueSetData = Import-PowerShellDataFile -LiteralPath $UserValueSetsPath
+        if ($userValueSetData.ValueSets -is [hashtable]) {
+            foreach ($userKey in @($userValueSetData.ValueSets.Keys)) {
+                $script:UserValueSets[[string]$userKey] = $userValueSetData.ValueSets[$userKey]
+                $AppConfig.ValueSets[[string]$userKey] = $userValueSetData.ValueSets[$userKey]
+                $script:ValueSetSource[[string]$userKey] = $UserValueSetsPath
+            }
+        }
+    }
+    catch {
+        [System.Windows.Forms.MessageBox]::Show(
+            "Unable to load the saved value sets file (it was ignored):`r`n$UserValueSetsPath`r`n`r`n$($_.Exception.Message)",
+            'Database Deployment Manager',
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Warning
+        ) | Out-Null
+    }
 }
 
 $DefaultValueSet = if ($AppConfig.DefaultValueSet -and $AppConfig.ValueSets.ContainsKey([string]$AppConfig.DefaultValueSet)) {
@@ -339,6 +396,9 @@ function Get-ValueSetData {
     return [pscustomobject]@{
         Name      = $SetName
         Platform  = if ($set.Platform) { [string]$set.Platform } else { 'MSSQL' }
+        Authentication = if ($set.Authentication) { [string]$set.Authentication } else { 'Windows' }
+        AuthUser  = if ($set.AuthUser) { [string]$set.AuthUser } else { '' }
+        SqlCmdPath = if ($set.SqlCmdPath) { [string]$set.SqlCmdPath } else { '' }
         Servers   = @($set.Hosts)
         Databases = @($set.Databases)
     }
@@ -393,7 +453,20 @@ function Apply-ValueSet {
 
     $set = Get-ValueSetData -SetName $SetName
     $script:CurrentValueSet = $set.Name
+    $script:CurrentAuthMode = $set.Authentication
+    $script:CurrentAuthUser = $set.AuthUser
+    $script:CurrentSqlCmdPath = $set.SqlCmdPath
     $lblValueSetValue.Text = $set.Name
+
+    if ($set.SqlCmdPath) {
+        $lblSqlCmd.Text = 'SQLCMD path (set by value set, box ignored)'
+        $txtSqlCmd.Enabled = $false
+        Write-Log "sqlcmd for this value set: $($set.SqlCmdPath)"
+    }
+    else {
+        $lblSqlCmd.Text = 'SQLCMD executable / path'
+        $txtSqlCmd.Enabled = $true
+    }
 
     Populate-ServerMenu -Servers $set.Servers
 
@@ -416,6 +489,329 @@ function Apply-ValueSet {
     }
 
     Write-Log "Value set selected: $($set.Name)"
+    if ($set.Authentication -eq 'Windows') {
+        Write-Log 'Authentication: Windows (the account running this tool)'
+    }
+    else {
+        Write-Log "Authentication: $($set.Authentication)$(if ($set.AuthUser) { ' as ' + $set.AuthUser })"
+    }
+}
+
+function ConvertTo-PsdLiteral {
+    param([string]$Text)
+
+    return "'" + ($Text -replace "'", "''") + "'"
+}
+
+function Save-UserValueSetsFile {
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add('# Database Deployment Manager - value sets saved from the GUI.')
+    $lines.Add('# This file is generated and rewritten by the tool and is excluded from source control.')
+    $lines.Add('# A value set here overrides a set with the same name in the main config file.')
+    $lines.Add('# If you edit it by hand, restart the tool afterwards.')
+    $lines.Add('@{')
+    $lines.Add('    ValueSets = @{')
+
+    foreach ($name in @($script:UserValueSets.Keys | Sort-Object)) {
+        $s = $script:UserValueSets[$name]
+        $lines.Add("        $(ConvertTo-PsdLiteral -Text $name) = @{")
+        $lines.Add("            Platform       = $(ConvertTo-PsdLiteral -Text ([string]$s.Platform))")
+        $lines.Add("            Authentication = $(ConvertTo-PsdLiteral -Text ([string]$s.Authentication))")
+        $lines.Add("            AuthUser       = $(ConvertTo-PsdLiteral -Text ([string]$s.AuthUser))")
+        $lines.Add("            SqlCmdPath     = $(ConvertTo-PsdLiteral -Text ([string]$s.SqlCmdPath))")
+        $lines.Add('            Hosts = @(')
+        foreach ($h in @($s.Hosts)) {
+            $lines.Add("                $(ConvertTo-PsdLiteral -Text ([string]$h))")
+        }
+        $lines.Add('            )')
+        $lines.Add('            Databases = @(')
+        foreach ($d in @($s.Databases)) {
+            $lines.Add("                $(ConvertTo-PsdLiteral -Text ([string]$d))")
+        }
+        $lines.Add('            )')
+        $lines.Add('        }')
+    }
+
+    $lines.Add('    }')
+    $lines.Add('}')
+
+    $text = ($lines -join "`r`n") + "`r`n"
+    [System.IO.File]::WriteAllText($UserValueSetsPath, $text, (New-Object System.Text.UTF8Encoding($true)))
+}
+
+function ConvertTo-CleanLineList {
+    param([string[]]$Lines)
+
+    $trimChars = [char[]]@(44, 39, 34)
+    $result = @()
+    foreach ($line in @($Lines)) {
+        $item = ([string]$line).Trim().Trim($trimChars).Trim()
+        if ($item -and ($result -notcontains $item)) {
+            $result += $item
+        }
+    }
+    return $result
+}
+
+function Show-ValueSetDialog {
+    $cur = Get-ValueSetData -SetName $script:CurrentValueSet
+    $startName = if ($script:UserValueSets.ContainsKey($cur.Name)) { $cur.Name } else { "$($cur.Name)-copy" }
+
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = 'New / edit value set'
+    $dlg.StartPosition = 'CenterParent'
+    $dlg.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+    $dlg.MaximizeBox = $false
+    $dlg.MinimizeBox = $false
+    $dlg.ShowInTaskbar = $false
+    $dlg.ClientSize = New-Object System.Drawing.Size(470, 595)
+
+    $addLabel = {
+        param([string]$Text, [int]$X, [int]$Y)
+        $l = New-Object System.Windows.Forms.Label
+        $l.Text = $Text
+        $l.Location = New-Object System.Drawing.Point($X, $Y)
+        $l.AutoSize = $true
+        $dlg.Controls.Add($l)
+    }
+
+    & $addLabel 'Value set name (an existing saved name is overwritten):' 20 15
+    $txtName = New-Object System.Windows.Forms.TextBox
+    $txtName.Location = New-Object System.Drawing.Point(20, 36)
+    $txtName.Size = New-Object System.Drawing.Size(430, 22)
+    $txtName.Text = $startName
+    $dlg.Controls.Add($txtName)
+
+    & $addLabel 'Platform:' 20 72
+    $cmbPlat = New-Object System.Windows.Forms.ComboBox
+    $cmbPlat.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+    $cmbPlat.Location = New-Object System.Drawing.Point(20, 93)
+    $cmbPlat.Size = New-Object System.Drawing.Size(200, 22)
+    foreach ($p in @($ConfiguredPlatforms)) { [void]$cmbPlat.Items.Add([string]$p) }
+    if ($cmbPlat.Items.Contains($cur.Platform)) { $cmbPlat.SelectedItem = $cur.Platform }
+    elseif ($cmbPlat.Items.Count -gt 0) { $cmbPlat.SelectedIndex = 0 }
+    $dlg.Controls.Add($cmbPlat)
+
+    & $addLabel 'Authentication:' 20 128
+    $cmbAuth = New-Object System.Windows.Forms.ComboBox
+    $cmbAuth.Name = 'cmbAuth'
+    $cmbAuth.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+    $cmbAuth.Location = New-Object System.Drawing.Point(20, 149)
+    $cmbAuth.Size = New-Object System.Drawing.Size(200, 22)
+    foreach ($a in @('Windows', 'SqlLogin', 'EntraInteractive', 'EntraDefault')) { [void]$cmbAuth.Items.Add($a) }
+    if ($cmbAuth.Items.Contains($cur.Authentication)) { $cmbAuth.SelectedItem = $cur.Authentication } else { $cmbAuth.SelectedIndex = 0 }
+    $dlg.Controls.Add($cmbAuth)
+
+    & $addLabel 'Login / sign-in user:' 240 128
+    $txtUser = New-Object System.Windows.Forms.TextBox
+    $txtUser.Name = 'txtUser'
+    $txtUser.Location = New-Object System.Drawing.Point(240, 149)
+    $txtUser.Size = New-Object System.Drawing.Size(210, 22)
+    $txtUser.Text = $cur.AuthUser
+    $txtUser.Enabled = (@('SqlLogin', 'EntraInteractive') -contains [string]$cmbAuth.SelectedItem)
+    $dlg.Controls.Add($txtUser)
+
+    $cmbAuth.Add_SelectedIndexChanged({
+        param($sender, $eventArgs)
+        $sender.Parent.Controls['txtUser'].Enabled = (@('SqlLogin', 'EntraInteractive') -contains [string]$sender.SelectedItem)
+    })
+
+    & $addLabel 'sqlcmd.exe for this set (optional; blank = use the main window box):' 20 184
+    $txtSqlPath = New-Object System.Windows.Forms.TextBox
+    $txtSqlPath.Location = New-Object System.Drawing.Point(20, 205)
+    $txtSqlPath.Size = New-Object System.Drawing.Size(430, 22)
+    $txtSqlPath.Text = $cur.SqlCmdPath
+    $dlg.Controls.Add($txtSqlPath)
+
+    & $addLabel 'Hosts (one per line, e.g. SERVER or SERVER\INSTANCE,port):' 20 239
+    $txtHosts = New-Object System.Windows.Forms.TextBox
+    $txtHosts.Multiline = $true
+    $txtHosts.AcceptsReturn = $true
+    $txtHosts.ScrollBars = [System.Windows.Forms.ScrollBars]::Vertical
+    $txtHosts.Location = New-Object System.Drawing.Point(20, 260)
+    $txtHosts.Size = New-Object System.Drawing.Size(430, 130)
+    $txtHosts.Text = (@($cur.Servers) -join "`r`n")
+    $dlg.Controls.Add($txtHosts)
+
+    & $addLabel 'Databases (one per line):' 20 400
+    $txtDbs = New-Object System.Windows.Forms.TextBox
+    $txtDbs.Multiline = $true
+    $txtDbs.AcceptsReturn = $true
+    $txtDbs.ScrollBars = [System.Windows.Forms.ScrollBars]::Vertical
+    $txtDbs.Location = New-Object System.Drawing.Point(20, 421)
+    $txtDbs.Size = New-Object System.Drawing.Size(430, 110)
+    $txtDbs.Text = (@($cur.Databases) -join "`r`n")
+    $dlg.Controls.Add($txtDbs)
+
+    $btnSave = New-Object System.Windows.Forms.Button
+    $btnSave.Text = 'Save'
+    $btnSave.Location = New-Object System.Drawing.Point(20, 550)
+    $btnSave.Size = New-Object System.Drawing.Size(100, 30)
+    $btnSave.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $dlg.Controls.Add($btnSave)
+
+    $btnDelete = New-Object System.Windows.Forms.Button
+    $btnDelete.Text = 'Delete saved set'
+    $btnDelete.Location = New-Object System.Drawing.Point(130, 550)
+    $btnDelete.Size = New-Object System.Drawing.Size(120, 30)
+    $btnDelete.DialogResult = [System.Windows.Forms.DialogResult]::Abort
+    $dlg.Controls.Add($btnDelete)
+
+    $btnCancel = New-Object System.Windows.Forms.Button
+    $btnCancel.Text = 'Cancel'
+    $btnCancel.Location = New-Object System.Drawing.Point(350, 550)
+    $btnCancel.Size = New-Object System.Drawing.Size(100, 30)
+    $btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $dlg.Controls.Add($btnCancel)
+
+    $dlg.AcceptButton = $btnSave
+    $dlg.CancelButton = $btnCancel
+
+    try {
+        while ($true) {
+            $result = $dlg.ShowDialog($form)
+            if ($result -eq [System.Windows.Forms.DialogResult]::Cancel) { return }
+
+            $name = $txtName.Text.Trim()
+            if ([string]::IsNullOrWhiteSpace($name)) {
+                [System.Windows.Forms.MessageBox]::Show('Enter a value set name.', 'Value set', 'OK', 'Warning') | Out-Null
+                continue
+            }
+
+            if ($result -eq [System.Windows.Forms.DialogResult]::Abort) {
+                if (-not $script:UserValueSets.ContainsKey($name)) {
+                    [System.Windows.Forms.MessageBox]::Show("'$name' is not a saved value set. Sets defined in the main config file are edited with 'Edit main config file...'.", 'Value set', 'OK', 'Information') | Out-Null
+                    continue
+                }
+                $confirm = [System.Windows.Forms.MessageBox]::Show("Delete the saved value set '$name'?", 'Value set', 'YesNo', 'Question')
+                if ($confirm -ne [System.Windows.Forms.DialogResult]::Yes) { continue }
+
+                $script:UserValueSets.Remove($name)
+                if ($script:BaseValueSets.ContainsKey($name)) {
+                    $AppConfig.ValueSets[$name] = $script:BaseValueSets[$name]
+                    $script:ValueSetSource[$name] = $ConfigPath
+                }
+                else {
+                    $AppConfig.ValueSets.Remove($name)
+                    $script:ValueSetSource.Remove($name)
+                }
+                Save-UserValueSetsFile
+                Rebuild-ValueSetMenu
+                Write-Log "Value set deleted: $name"
+                if ($script:CurrentValueSet -eq $name) {
+                    Apply-ValueSet -SetName $DefaultValueSet
+                }
+                return
+            }
+
+            $hostList = @(ConvertTo-CleanLineList -Lines $txtHosts.Lines)
+            $dbList = @(ConvertTo-CleanLineList -Lines $txtDbs.Lines)
+            $authMode = [string]$cmbAuth.SelectedItem
+            $authUser = $txtUser.Text.Trim()
+
+            if ($hostList.Count -eq 0) {
+                [System.Windows.Forms.MessageBox]::Show('Enter at least one host.', 'Value set', 'OK', 'Warning') | Out-Null
+                continue
+            }
+            if (@('SqlLogin', 'EntraInteractive') -contains $authMode -and [string]::IsNullOrWhiteSpace($authUser)) {
+                [System.Windows.Forms.MessageBox]::Show("$authMode needs a user: the SQL login name, or the Microsoft Entra user (for example user@domain.com).", 'Value set', 'OK', 'Warning') | Out-Null
+                continue
+            }
+            if (@('SqlLogin', 'EntraInteractive') -notcontains $authMode) { $authUser = '' }
+
+            $newSet = @{
+                Platform       = [string]$cmbPlat.SelectedItem
+                Authentication = $authMode
+                AuthUser       = $authUser
+                SqlCmdPath     = $txtSqlPath.Text.Trim().Trim([char]34)
+                Hosts          = $hostList
+                Databases      = $dbList
+            }
+
+            $script:UserValueSets[$name] = $newSet
+            $AppConfig.ValueSets[$name] = $newSet
+            $script:ValueSetSource[$name] = $UserValueSetsPath
+
+            try {
+                Save-UserValueSetsFile
+            }
+            catch {
+                Write-Log "Unable to save the value sets file: $($_.Exception.Message)" 'Error'
+                [System.Windows.Forms.MessageBox]::Show("Unable to save:`r`n$UserValueSetsPath`r`n`r`n$($_.Exception.Message)", 'Value set', 'OK', 'Error') | Out-Null
+                return
+            }
+
+            Rebuild-ValueSetMenu
+            Apply-ValueSet -SetName $name
+            Write-Log "Value set saved: $name ($UserValueSetsPath)"
+            return
+        }
+    }
+    finally {
+        $dlg.Dispose()
+    }
+}
+
+function Rebuild-ValueSetMenu {
+    $ctxValueSet.Items.Clear()
+
+    foreach ($setName in @($AppConfig.ValueSets.Keys | Sort-Object)) {
+        $setItem = New-Object System.Windows.Forms.ToolStripMenuItem
+        $setItem.Text = [string]$setName
+        $setItem.Tag = [string]$setName
+        $setItem.Add_Click({
+            param($sender, $eventArgs)
+            Apply-ValueSet -SetName ([string]$sender.Tag)
+        })
+        [void]$ctxValueSet.Items.Add($setItem)
+    }
+
+    [void]$ctxValueSet.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+
+    $newSetItem = New-Object System.Windows.Forms.ToolStripMenuItem
+    $newSetItem.Text = 'New / edit value set...'
+    $newSetItem.Add_Click({
+        Show-ValueSetDialog
+    })
+    [void]$ctxValueSet.Items.Add($newSetItem)
+
+    $forgetPwdItem = New-Object System.Windows.Forms.ToolStripMenuItem
+    $forgetPwdItem.Text = 'Forget SQL login password'
+    $forgetPwdItem.Add_Click({
+        Clear-SqlLoginPassword
+        Write-Log 'SQL login password forgotten for this session.'
+    })
+    [void]$ctxValueSet.Items.Add($forgetPwdItem)
+
+    $editSetFileItem = New-Object System.Windows.Forms.ToolStripMenuItem
+    $editSetFileItem.Text = 'Edit config file...'
+    $editSetFileItem.Add_Click({
+        try {
+            $target = $script:ValueSetSource[[string]$script:CurrentValueSet]
+            if (-not $target) { $target = $ConfigPath }
+            Start-Process -FilePath 'notepad.exe' -ArgumentList ('"' + $target + '"')
+            Write-Log "Opened for editing (holds value set '$($script:CurrentValueSet)'): $target"
+            Write-Log 'Restart Database Deployment Manager to load manual changes.' 'Warning'
+        }
+        catch {
+            Write-Log "Unable to open the config file: $($_.Exception.Message)" 'Error'
+        }
+    })
+    [void]$ctxValueSet.Items.Add($editSetFileItem)
+
+    $editMainItem = New-Object System.Windows.Forms.ToolStripMenuItem
+    $editMainItem.Text = 'Edit main config file...'
+    $editMainItem.Add_Click({
+        try {
+            Start-Process -FilePath 'notepad.exe' -ArgumentList ('"' + $ConfigPath + '"')
+            Write-Log "Opened for editing: $ConfigPath"
+            Write-Log 'Restart Database Deployment Manager to load manual changes.' 'Warning'
+        }
+        catch {
+            Write-Log "Unable to open the config file: $($_.Exception.Message)" 'Error'
+        }
+    })
+    [void]$ctxValueSet.Items.Add($editMainItem)
 }
 
 function Get-CurrentWindowLayout {
@@ -1113,9 +1509,116 @@ function New-PreparedDeploymentFile {
         -DbMapReplacement $txtDbMapReplacement.Text.Trim()
 }
 
+function Get-EffectiveSqlCmdPath {
+    if (-not [string]::IsNullOrWhiteSpace([string]$script:CurrentSqlCmdPath)) {
+        return ([string]$script:CurrentSqlCmdPath).Trim()
+    }
+    return $txtSqlCmd.Text.Trim()
+}
+
 function Get-SqlCmdPath {
     param([string]$PreferredPath)
     return Get-DDMSqlCmdPath -PreferredPath $PreferredPath
+}
+
+$script:SqlLoginPasswords = @{}
+
+function Read-SqlLoginPassword {
+    param([string]$User)
+
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text = 'SQL login password'
+    $dlg.StartPosition = 'CenterParent'
+    $dlg.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+    $dlg.MaximizeBox = $false
+    $dlg.MinimizeBox = $false
+    $dlg.ShowInTaskbar = $false
+    $dlg.ClientSize = New-Object System.Drawing.Size(400, 130)
+
+    $lbl = New-Object System.Windows.Forms.Label
+    $lbl.Text = "Password for SQL login '$User' (kept in memory only for this session):"
+    $lbl.Location = New-Object System.Drawing.Point(15, 15)
+    $lbl.Size = New-Object System.Drawing.Size(370, 36)
+    $dlg.Controls.Add($lbl)
+
+    $txt = New-Object System.Windows.Forms.TextBox
+    $txt.UseSystemPasswordChar = $true
+    $txt.Location = New-Object System.Drawing.Point(15, 55)
+    $txt.Size = New-Object System.Drawing.Size(370, 22)
+    $dlg.Controls.Add($txt)
+
+    $ok = New-Object System.Windows.Forms.Button
+    $ok.Text = 'OK'
+    $ok.Location = New-Object System.Drawing.Point(215, 90)
+    $ok.Size = New-Object System.Drawing.Size(80, 28)
+    $ok.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $dlg.Controls.Add($ok)
+
+    $cancel = New-Object System.Windows.Forms.Button
+    $cancel.Text = 'Cancel'
+    $cancel.Location = New-Object System.Drawing.Point(305, 90)
+    $cancel.Size = New-Object System.Drawing.Size(80, 28)
+    $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $dlg.Controls.Add($cancel)
+
+    $dlg.AcceptButton = $ok
+    $dlg.CancelButton = $cancel
+
+    try {
+        if ($dlg.ShowDialog($form) -ne [System.Windows.Forms.DialogResult]::OK) { return $null }
+        if ($txt.Text.Length -eq 0) { return $null }
+
+        $secure = New-Object System.Security.SecureString
+        foreach ($ch in $txt.Text.ToCharArray()) { $secure.AppendChar($ch) }
+        $secure.MakeReadOnly()
+        return $secure
+    }
+    finally {
+        $txt.Text = ''
+        $dlg.Dispose()
+    }
+}
+
+function Ensure-SqlLoginPassword {
+    param(
+        [string]$AuthMode = $script:CurrentAuthMode,
+        [string]$AuthUser = $script:CurrentAuthUser
+    )
+
+    if ($AuthMode -ne 'SqlLogin') {
+        Remove-Item -Path Env:\SQLCMDPASSWORD -ErrorAction SilentlyContinue
+        return
+    }
+
+    $key = ([string]$AuthUser).ToLowerInvariant()
+    if (-not $script:SqlLoginPasswords.ContainsKey($key)) {
+        $secure = Read-SqlLoginPassword -User $AuthUser
+        if ($null -eq $secure) {
+            throw "Password entry for SQL login '$AuthUser' was cancelled."
+        }
+        $script:SqlLoginPasswords[$key] = $secure
+    }
+
+    $ptr = [IntPtr]::Zero
+    try {
+        $ptr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($script:SqlLoginPasswords[$key])
+        $env:SQLCMDPASSWORD = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr)
+    }
+    finally {
+        if ($ptr -ne [IntPtr]::Zero) {
+            [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr)
+        }
+    }
+}
+
+function Clear-SqlLoginPassword {
+    param([string]$AuthUser = $script:CurrentAuthUser)
+
+    $key = ([string]$AuthUser).ToLowerInvariant()
+    if ($script:SqlLoginPasswords.ContainsKey($key)) {
+        $script:SqlLoginPasswords.Remove($key)
+    }
+    Remove-Item -Path Env:\SQLCMDPASSWORD -ErrorAction SilentlyContinue
 }
 
 function Invoke-SqlCmdText {
@@ -1124,15 +1627,25 @@ function Invoke-SqlCmdText {
         [Parameter(Mandatory)][string]$Database,
         [Parameter(Mandatory)][string]$Query,
         [Parameter(Mandatory)][string]$SqlCmdExe,
-        [int]$QueryTimeout = 120
+        [int]$QueryTimeout = 120,
+        [string]$AuthMode = $script:CurrentAuthMode,
+        [string]$AuthUser = $script:CurrentAuthUser
     )
 
-    return Invoke-DDMSqlCmdText `
-        -ServerInstance $ServerInstance `
-        -Database $Database `
-        -Query $Query `
-        -SqlCmdExe $SqlCmdExe `
-        -QueryTimeout $QueryTimeout
+    Ensure-SqlLoginPassword -AuthMode $AuthMode -AuthUser $AuthUser
+    try {
+        return Invoke-DDMSqlCmdText `
+            -ServerInstance $ServerInstance `
+            -Database $Database `
+            -Query $Query `
+            -SqlCmdExe $SqlCmdExe `
+            -QueryTimeout $QueryTimeout `
+            -AuthMode $AuthMode `
+            -AuthUser $AuthUser
+    }
+    finally {
+        Remove-Item -Path Env:\SQLCMDPASSWORD -ErrorAction SilentlyContinue
+    }
 }
 
 function Invoke-SqlCmdFile {
@@ -1141,15 +1654,25 @@ function Invoke-SqlCmdFile {
         [Parameter(Mandatory)][string]$Database,
         [Parameter(Mandatory)][string]$FilePath,
         [Parameter(Mandatory)][string]$SqlCmdExe,
-        [int]$QueryTimeout = 120
+        [int]$QueryTimeout = 120,
+        [string]$AuthMode = $script:CurrentAuthMode,
+        [string]$AuthUser = $script:CurrentAuthUser
     )
 
-    return Invoke-DDMSqlCmdFile `
-        -ServerInstance $ServerInstance `
-        -Database $Database `
-        -FilePath $FilePath `
-        -SqlCmdExe $SqlCmdExe `
-        -QueryTimeout $QueryTimeout
+    Ensure-SqlLoginPassword -AuthMode $AuthMode -AuthUser $AuthUser
+    try {
+        return Invoke-DDMSqlCmdFile `
+            -ServerInstance $ServerInstance `
+            -Database $Database `
+            -FilePath $FilePath `
+            -SqlCmdExe $SqlCmdExe `
+            -QueryTimeout $QueryTimeout `
+            -AuthMode $AuthMode `
+            -AuthUser $AuthUser
+    }
+    finally {
+        Remove-Item -Path Env:\SQLCMDPASSWORD -ErrorAction SilentlyContinue
+    }
 }
 
 function Get-ReviewStatusColumnIndex {
@@ -1381,13 +1904,15 @@ function Build-DeploymentScript {
     $database = [string]$cmbDatabase.Text
     $initItems = @(Get-InitializationItems)
     $items = @(Get-SelectedDeploymentItems)
-    $preferredSqlCmd = $txtSqlCmd.Text.Trim()
+    $preferredSqlCmd = Get-EffectiveSqlCmdPath
     $configuredRepositoryRoot = $txtRepoRoot.Text.Trim()
     $allSelectedItems = @($initItems) + @($items)
     $repositoryRoot = Get-DDMGeneratedRepositoryRoot `
         -Items $allSelectedItems `
         -ConfiguredRoot $configuredRepositoryRoot
     $commandTimeout = [int]$numTimeout.Value
+    $authMode = if ($script:CurrentAuthMode) { [string]$script:CurrentAuthMode } else { 'Windows' }
+    $authUser = if ($script:CurrentAuthUser) { [string]$script:CurrentAuthUser } else { '' }
     $awsProfile = if ($chkUseAwsProfile.Checked) { $txtAwsProfile.Text.Trim() } else { '' }
     $createOrAlter = [bool]$chkCreateOrAlter.Checked
     $manageUseStatements = [bool]$chkManageUseStatements.Checked
@@ -1453,12 +1978,16 @@ function Build-DeploymentScript {
     Database Deployment Manager - Generated Deployment Script
 
 .VERSION
-    1.0.0
+    1.2.0
 
 .GENERATED
     $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
 
 .CHANGES
+    2026-10-11 - v1.2.0
+      - SqlLogin authentication: the script prompts for the password at run time.
+    2026-10-11 - v1.1.0
+      - Authentication mode (Windows, EntraInteractive, EntraDefault) is recorded below.
     2026-10-10 - v1.0.0
       - Initial public release.
 #>
@@ -1478,6 +2007,18 @@ $serverLiteral
 
 `$PreferredSqlCmdPath = $(Quote-PowerShellLiteral $preferredSqlCmd)
 `$QueryTimeout = $commandTimeout
+`$AuthMode = $(Quote-PowerShellLiteral $authMode)
+`$AuthUser = $(Quote-PowerShellLiteral $authUser)
+if (`$AuthMode -eq 'SqlLogin' -and [string]::IsNullOrEmpty(`$env:SQLCMDPASSWORD)) {
+    `$SecurePassword = Read-Host -Prompt "Password for SQL login [`$AuthUser]" -AsSecureString
+    `$PasswordPointer = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR(`$SecurePassword)
+    try {
+        `$env:SQLCMDPASSWORD = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR(`$PasswordPointer)
+    }
+    finally {
+        [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR(`$PasswordPointer)
+    }
+}
 `$AwsProfile = $(Quote-PowerShellLiteral $awsProfile)
 `$CreateOrAlter = `$$createOrAlter
 `$ManageUseStatements = `$$manageUseStatements
@@ -1725,16 +2266,22 @@ foreach (`$Server in `$Servers) {
 
             Write-Host "Initializing: `$(`$Item.DisplayName)"
 
-            `$SqlCmdArgs = @(
-                '-S', `$Server,
-                '-d', `$Database,
-                '-E',
+            `$AuthArgs = switch (`$AuthMode) {
+                'Windows'          { @('-E') }
+                'SqlLogin'         { @('-U', `$AuthUser) }
+                'EntraInteractive' { @('-G', '-U', `$AuthUser) }
+                'EntraDefault'     { @('-G') }
+                default            { throw "Unsupported AuthMode [`$AuthMode]." }
+            }
+            `$LoginTimeout = if (@('Windows', 'SqlLogin') -contains `$AuthMode) { '30' } else { '120' }
+
+            `$SqlCmdArgs = @('-S', `$Server, '-d', `$Database) + @(`$AuthArgs) + @(
                 '-b',
                 '-w', '65535',
                 '-y', '0',
                 '-Y', '0',
                 '-i', `$PreparedFile,
-                '-l', '30',
+                '-l', `$LoginTimeout,
                 '-t', `$QueryTimeout
             )
 
@@ -1818,16 +2365,22 @@ foreach (`$Server in `$Servers) {
 
             Write-Host "Executing: `$(`$Item.DisplayName)"
 
-            `$SqlCmdArgs = @(
-                '-S', `$Server,
-                '-d', `$Database,
-                '-E',
+            `$AuthArgs = switch (`$AuthMode) {
+                'Windows'          { @('-E') }
+                'SqlLogin'         { @('-U', `$AuthUser) }
+                'EntraInteractive' { @('-G', '-U', `$AuthUser) }
+                'EntraDefault'     { @('-G') }
+                default            { throw "Unsupported AuthMode [`$AuthMode]." }
+            }
+            `$LoginTimeout = if (@('Windows', 'SqlLogin') -contains `$AuthMode) { '30' } else { '120' }
+
+            `$SqlCmdArgs = @('-S', `$Server, '-d', `$Database) + @(`$AuthArgs) + @(
                 '-b',
                 '-w', '65535',
                 '-y', '0',
                 '-Y', '0',
                 '-i', `$PreparedFile,
-                '-l', '30',
+                '-l', `$LoginTimeout,
                 '-t', `$QueryTimeout
             )
 
@@ -1922,7 +2475,7 @@ function Validate-ImmediateDeployment {
         throw 'One or more selected File System items do not exist.'
     }
 
-    $sqlCmdExe = Get-SqlCmdPath -PreferredPath $txtSqlCmd.Text.Trim()
+    $sqlCmdExe = Get-SqlCmdPath -PreferredPath (Get-EffectiveSqlCmdPath)
 
     if (-not $sqlCmdExe) {
         throw 'sqlcmd.exe was not found on PATH or in the standard SQL client tool locations.'
@@ -2069,31 +2622,7 @@ $left.Controls.Add($btnValueSet)
 
 $ctxValueSet = New-Object System.Windows.Forms.ContextMenuStrip
 
-foreach ($setName in @($AppConfig.ValueSets.Keys | Sort-Object)) {
-    $setItem = New-Object System.Windows.Forms.ToolStripMenuItem
-    $setItem.Text = [string]$setName
-    $setItem.Tag = [string]$setName
-    $setItem.Add_Click({
-        param($sender, $eventArgs)
-        Apply-ValueSet -SetName ([string]$sender.Tag)
-    })
-    [void]$ctxValueSet.Items.Add($setItem)
-}
-
-[void]$ctxValueSet.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
-
-$editConfigItem = New-Object System.Windows.Forms.ToolStripMenuItem
-$editConfigItem.Text = 'Edit config file...'
-$editConfigItem.Add_Click({
-    try {
-        Start-Process -FilePath 'notepad.exe' -ArgumentList ('"' + $ConfigPath + '"')
-        Write-Log 'Config file opened for editing. Restart Database Deployment Manager to load the changes.' 'Warning'
-    }
-    catch {
-        Write-Log "Unable to open the config file: $($_.Exception.Message)" 'Error'
-    }
-})
-[void]$ctxValueSet.Items.Add($editConfigItem)
+Rebuild-ValueSetMenu
 
 $btnValueSet.Add_Click({
     $point = New-Object System.Drawing.Point(0, $btnValueSet.Height)
@@ -3125,11 +3654,13 @@ $btnTestConnection.Add_Click({
             throw 'Select a target database.'
         }
 
-        $sqlCmdExe = Get-SqlCmdPath -PreferredPath $txtSqlCmd.Text.Trim()
+        $sqlCmdExe = Get-SqlCmdPath -PreferredPath (Get-EffectiveSqlCmdPath)
 
         if (-not $sqlCmdExe) {
             throw 'sqlcmd.exe was not found on PATH or in the standard SQL client tool locations.'
         }
+
+        Write-Log "Using sqlcmd: $sqlCmdExe"
 
         $query = @"
 SET NOCOUNT ON;
@@ -3141,6 +3672,10 @@ SELECT
 
         $tabsBottom.SelectedTab = $tabLog
         $results = @()
+
+        if ($script:CurrentAuthMode -like 'Entra*') {
+            Write-Log "Authentication: $($script:CurrentAuthMode). A Microsoft Entra sign-in window may open; complete it to continue."
+        }
 
         foreach ($server in $servers) {
             Write-Log "Testing connection to $server / $database..."
@@ -3167,6 +3702,10 @@ SELECT
             }
             catch {
                 Write-Log "Connection failed: $server / $database. $($_.Exception.Message)" 'Error'
+                if ($script:CurrentAuthMode -eq 'SqlLogin') {
+                    Clear-SqlLoginPassword
+                    Write-Log 'The saved SQL login password was forgotten; you will be asked again on the next attempt.' 'Warning'
+                }
                 $results += "$server : FAILED"
             }
         }
@@ -3627,6 +4166,7 @@ Proceed?
             }
         }
 
+        Ensure-SqlLoginPassword
         $deploymentResult = Invoke-DDMDeploymentPlan `
             -Servers $servers `
             -Database $database `
@@ -3634,6 +4174,8 @@ Proceed?
             -DeploymentItems $items `
             -SqlCmdExe $sqlCmdExe `
             -QueryTimeout $queryTimeout `
+            -AuthMode $script:CurrentAuthMode `
+            -AuthUser $script:CurrentAuthUser `
             -AwsExe $(if ($awsExe) { $awsExe } else { '' }) `
             -UseAwsProfile ([bool]$chkUseAwsProfile.Checked) `
             -AwsProfile $txtAwsProfile.Text.Trim() `
@@ -3646,6 +4188,7 @@ Proceed?
             -DbMapReplacement $txtDbMapReplacement.Text.Trim() `
             -LogAction $engineLogger
 
+        Remove-Item -Path Env:\SQLCMDPASSWORD -ErrorAction SilentlyContinue
         Update-ReviewAfterDeployment -DeploymentResult $deploymentResult
 
         if ($deploymentResult.ErrorCount -gt 0) {

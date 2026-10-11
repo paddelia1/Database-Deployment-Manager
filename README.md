@@ -6,10 +6,23 @@ review what will run, and deploy to one or many SQL Server instances, with the
 steps and settings you used last time already filled in.
 
 Written in PowerShell. No installer, no database of its own, nothing to host:
-fork it, edit one config file, and run it.
+fork it, add your servers, and run it.
+
+## Connects to
+
+| Target | Sign-in |
+|---|---|
+| **SQL Server** (local, network, named instances) | **Windows integrated security**, using the account running the tool |
+| **SQL Server** (local, network, named instances) | **SQL login** - the password is asked once per session and never stored |
+| **Microsoft Fabric** warehouses | **Microsoft Entra ID** - browser sign-in, or a one-time Azure CLI sign-in with no prompts during the deployment |
+| **Azure SQL** | Microsoft Entra ID (same sign-in as Fabric; not yet tested) |
+
+The sign-in method is chosen per value set, so one tool can deploy to a local
+server with a SQL login and to a Fabric warehouse with Entra ID, switching in
+one click.
 
 - **Author:** Philippe Addelia
-- **Version:** 1.0.0
+- **Version:** 1.2.0
 - **License:** MIT (see [LICENSE](LICENSE))
 
 ## What it does
@@ -38,6 +51,11 @@ Manager puts a review step in front of the deployment:
 - **Script preparation.** Optional conversion to `CREATE OR ALTER`, control of
   which database each script runs against, and protection for the
   `ANSI_NULLS` / `QUOTED_IDENTIFIER` settings.
+- **Local SQL Server and Fabric.** Windows integrated security or a SQL login
+  for SQL Server; Microsoft Entra ID for Microsoft Fabric warehouses and Azure
+  SQL. Each value set can also use its own `sqlcmd.exe`.
+- **Build lists in the GUI.** Create and edit value sets (servers, databases,
+  sign-in method) from a dialog, with no config editing and no restart.
 - **Files or S3.** Deploy from a local repository folder or from an AWS S3
   bucket.
 - **Repeatable.** Save and reload a deployment order, or generate a portable
@@ -45,26 +63,21 @@ Manager puts a review step in front of the deployment:
 - **Extensible.** Engines are organized by platform; SQL Server is implemented
   today.
 
-<!--
-SCREENSHOTS (enable once images are added to docs/images/):
+## Screenshot
 
-## Screenshots
+![Database Deployment Manager main window](docs/images/DeplMgr.png)
 
-![Main window](docs/images/main-window.png)
-*The main window: pick a value set, servers and source, then build the review.*
-
-![Review grid](docs/images/review-grid.png)
-*Pre-deployment review: include, exclude and order the scripts.*
-
-![Deployment result](docs/images/deployment-result.png)
-*Results and error details after a deployment.*
--->
+*The main window deploying Microsoft's WideWorldImporters sample stored
+procedures: settings on the left, the pre-deployment review grid on the right,
+and the generated script and deployment log below.*
 
 ## Requirements
 
 - Windows PowerShell 5.1 or later
-- `sqlcmd.exe` (SQL Server command-line tools)
+- `sqlcmd.exe` (SQL Server command-line tools). Microsoft Fabric with Entra
+  ID works best with the newer Go-based sqlcmd
 - Network access from your machine to the target servers
+- Azure CLI, optional: lets Fabric deployments sign in once instead of per file
 - AWS CLI, only if you deploy from S3
 
 ## Quick start
@@ -80,11 +93,15 @@ SCREENSHOTS (enable once images are added to docs/images/):
    `Get-ChildItem -Recurse | Unblock-File` first.
 3. On first launch the tool creates your personal config from the shipped
    example. Click **...** next to **Value set**, choose
-   **Edit config file...**, enter your own servers, databases and repository
-   folder, save, and restart.
+   **New / edit value set...**, enter your servers and databases, choose the
+   sign-in method (Windows, SQL login or Microsoft Entra) and save. The set is
+   available immediately.
+4. Click **Test Connection** before you deploy anything.
 
-Your personal config is excluded from git, so pulling updates from this
-repository never overwrites it.
+Your personal config and saved value sets are excluded from git, so pulling
+updates from this repository never overwrites them. The
+[Usage Guide](docs/USAGE.md) has step-by-step installation, every setting and
+worked examples for local SQL Server and Microsoft Fabric.
 
 > **Test first.** This tool runs SQL against the servers you select. Try it on
 > a non-production server before using it on anything important. It is
@@ -92,8 +109,9 @@ repository never overwrites it.
 
 ## Documentation
 
-See the [Usage Guide](docs/USAGE.md) for configuration, the explicit file list
-format, deployment options, remembered settings and troubleshooting.
+See the [Usage Guide](docs/USAGE.md) for installation, key terms, configuration,
+sign-in methods (Windows, SQL login, Microsoft Entra / Fabric), the explicit
+file list format, deployment options, remembered settings and troubleshooting.
 
 ## Project layout
 
