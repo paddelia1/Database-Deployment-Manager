@@ -1,18 +1,20 @@
-# Build and Release Folders
-bin-debug/
-bin-release/
-[Oo]bj/
-[Bb]in/
+# Personal configuration (created from Config/Database Deployment config.example.psd1 on first run)
+Config/Database Deployment config.psd1
 
-# Other files and folders
-.settings/
+# Local diagnostics and logs
+Error.txt
+*.log
 
-# Executables
-*.swf
-*.air
-*.ipa
-*.apk
+# Saved GUI state (normally lives in %LOCALAPPDATA%, listed in case it is copied here)
+state.json
 
-# Project files, i.e. `.project`, `.actionScriptProperties` and `.flexProperties`
-# should NOT be excluded as they contain compiler settings and other important
-# information for Eclipse / Flash Builder.
+# Generated deployment scripts and prepared SQL
+Generated/
+DDM_SQL_*.sql
+
+# Editors and OS files
+.vs/
+.vscode/
+*.tmp
+Thumbs.db
+Desktop.ini
